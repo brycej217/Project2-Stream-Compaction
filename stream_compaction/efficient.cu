@@ -145,6 +145,53 @@ namespace StreamCompaction {
         }
 
         /**
+        * Performs prefix-sum (aka scan) on idata, storing the result into odata, WITH data arrays being device handles
+        */
+        void scanGPU(int n, int* odata, const int* idata, int numBlocks) {
+            // declare block sum array to support scans of arbitrary length
+            int* d_blockSums;
+            cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
+
+            cudaMemcpy(odata, idata, n * sizeof(int), cudaMemcpyDeviceToDevice);
+
+            scan<<<numBlocks, BLOCKSIZE>>>(n, ilog2ceil(BLOCKSIZE), odata, d_blockSums);
+
+            assert(numBlocks <= 1024); // if numBlocks is greater than 1024, we cannot operate on it
+
+            scanBlock << <1, numBlocks >> > (numBlocks, ilog2ceil(numBlocks), d_blockSums);
+
+            add<<<numBlocks, BLOCKSIZE >> > (n, odata, d_blockSums);
+        }
+
+        __global__ void temp(int n, int badVal, int* odata, int* idata)
+        {
+            int k = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+            if (k >= n) return;
+
+            if (idata[k] == badVal)
+            {
+                odata[k] = 0;
+            }
+            else
+            {
+                odata[k] = 1;
+            }
+        }
+
+        __global__ void scatter(int n, int* odata, int* tdata, int* sdata, int* idata)
+        {
+            int k = (blockIdx.x * blockDim.x) + threadIdx.x;
+
+            if (k >= n) return;
+
+            if (tdata[k] == 1)
+            {
+                odata[sdata[k]] = idata[k];
+            }
+        }
+
+        /**
          * Performs stream compaction on idata, storing the result into odata.
          * All zeroes are discarded.
          *
@@ -156,9 +203,39 @@ namespace StreamCompaction {
         int compact(int n, int *odata, const int *idata) {
             timer().startGpuTimer();
 
+            // create memory scaled to power of 2
+            int ilog2 = static_cast<int>(ilog2ceil(n));
+            int size = static_cast<int>(pow(2, ilog2));
+
+            int* d_odata;
+            int* d_idata;
+            int* d_tdata;
+            int* d_sdata;
+            cudaMalloc((void**)&d_odata, size * sizeof(int));
+            cudaMalloc((void**)&d_idata, size * sizeof(int));
+            cudaMalloc((void**)&d_tdata, size * sizeof(int));
+            cudaMalloc((void**)&d_sdata, size * sizeof(int));
+
+            cudaMemcpy(d_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+
+            int numBlocks = (size + BLOCKSIZE - 1) / BLOCKSIZE;
+            temp<<<numBlocks, BLOCKSIZE>>>(n, 0, d_tdata, d_idata);
+
+            scanGPU(size, d_sdata, d_tdata, numBlocks);
+
+            // get count
+            int s = 0;
+            int t = 0;
+            cudaMemcpy(&s, d_sdata + (n - 1), sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&t, d_tdata + (n - 1), sizeof(int), cudaMemcpyDeviceToHost);
+            int count = s + t;
+
+            scatter<<<numBlocks, BLOCKSIZE>>>(n, d_odata, d_tdata, d_sdata, d_idata);
+
+            cudaMemcpy(odata, d_odata, n * sizeof(int), cudaMemcpyDeviceToHost);
 
             timer().endGpuTimer();
-            return -1;
+            return count;
         }
     }
 }
