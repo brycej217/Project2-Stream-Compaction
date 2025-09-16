@@ -91,9 +91,11 @@ namespace StreamCompaction {
             }
             else
             {
-                scan<< <1, BLOCKSIZE >> > (numBlocks, ilog2ceil(BLOCKSIZE), d_blockSums, d_garbage);
+                scan << <1, BLOCKSIZE >> > (numBlocks, ilog2ceil(BLOCKSIZE), d_blockSums, d_garbage);
             }
             add << <numBlocks, BLOCKSIZE >> > (n, data, d_blockSums);
+
+            cudaFree(d_blockSums);
         }
 
         /**
@@ -115,7 +117,7 @@ namespace StreamCompaction {
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
             timer().startGpuTimer();
-            scan<<<numBlocks, BLOCKSIZE>>>(size, ilog2ceil(BLOCKSIZE), d_odata, d_blockSums);
+            scan << <numBlocks, BLOCKSIZE >> > (size, ilog2ceil(BLOCKSIZE), d_odata, d_blockSums);
 
             scanRecursive(numBlocks, d_blockSums);
 
@@ -123,6 +125,9 @@ namespace StreamCompaction {
             timer().endGpuTimer();
 
             cudaMemcpy(odata, d_odata, size * sizeof(int), cudaMemcpyDeviceToHost);
+
+            cudaFree(d_odata);
+            cudaFree(d_blockSums);
         }
 
         __global__ void temp(int n, int badVal, int* odata, int* idata)
@@ -208,6 +213,13 @@ namespace StreamCompaction {
             int count = s + t;
 
             cudaMemcpy(odata, d_odata, n * sizeof(int), cudaMemcpyDeviceToHost);
+
+            cudaFree(d_idata);
+            cudaFree(d_odata);
+            cudaFree(d_tdata);
+            cudaFree(d_sdata);
+            cudaFree(d_blockSums);
+
             return count;
         }
     }
