@@ -5,7 +5,7 @@
 #include "device_launch_parameters.h"
 #include <cassert>
 
-#define BLOCKSIZE 128 // ensure blocksize is a power of 2 for this implementation
+#define BLOCKSIZE 512 // ensure blocksize is a power of 2 for this implementation
 
 namespace StreamCompaction {
     namespace Efficient {
@@ -125,26 +125,6 @@ namespace StreamCompaction {
             cudaMemcpy(odata, d_odata, size * sizeof(int), cudaMemcpyDeviceToHost);
         }
 
-        /**
-        * Performs prefix-sum (aka scan) on idata, storing the result into odata, WITH data arrays being device handles
-        */
-        void scanGPU(int n, int* odata, const int* idata, int numBlocks) {
-            // declare block sum array to support scans of arbitrary length
-            int* d_blockSums;
-            int* d_garbage;
-            cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
-            cudaMalloc((void**)&d_garbage, n * sizeof(int));
-            cudaMemcpy(odata, idata, n * sizeof(int), cudaMemcpyDeviceToDevice);
-
-            scan << <numBlocks, BLOCKSIZE >> > (n, ilog2ceil(BLOCKSIZE), odata, d_blockSums);
-
-            //assert(numBlocks <= 1024); // if numBlocks is greater than 1024, we cannot operate on it
-
-            scan<< <1, numBlocks >> > (numBlocks, ilog2ceil(numBlocks), d_blockSums, d_garbage);
-
-            add << <numBlocks, BLOCKSIZE >> > (n, odata, d_blockSums);
-        }
-
         __global__ void temp(int n, int badVal, int* odata, int* idata)
         {
             int k = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -188,24 +168,33 @@ namespace StreamCompaction {
             int ilog2 = static_cast<int>(ilog2ceil(n));
             int size = static_cast<int>(pow(2, ilog2));
 
-            int* d_odata;
             int* d_idata;
+            int* d_odata;
             int* d_tdata;
             int* d_sdata;
-            cudaMalloc((void**)&d_odata, size * sizeof(int));
+            int* d_blockSums;
             cudaMalloc((void**)&d_idata, size * sizeof(int));
+            cudaMalloc((void**)&d_odata, size * sizeof(int));
             cudaMalloc((void**)&d_tdata, size * sizeof(int));
             cudaMalloc((void**)&d_sdata, size * sizeof(int));
+            cudaMalloc((void**)&d_garbage, size * sizeof(int));
 
+            cudaMemset(d_idata, 0, size * sizeof(int));
             cudaMemcpy(d_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
 
             int numBlocks = (size + BLOCKSIZE - 1) / BLOCKSIZE;
-
+            cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
             timer().startGpuTimer();
-            temp << <numBlocks, BLOCKSIZE >> > (n, 0, d_tdata, d_idata);
+            temp << <numBlocks, BLOCKSIZE >> > (size, 0, d_tdata, d_idata);
 
-            scanGPU(size, d_sdata, d_tdata, numBlocks);
+            cudaMemcpy(d_sdata, d_tdata, size * sizeof(int), cudaMemcpyDeviceToDevice);
+
+            scan << <numBlocks, BLOCKSIZE >> > (size, ilog2ceil(BLOCKSIZE), d_sdata, d_blockSums);
+
+            scanRecursive(numBlocks, d_blockSums);
+
+            add << <numBlocks, BLOCKSIZE >> > (n, d_sdata, d_blockSums);
 
             scatter << <numBlocks, BLOCKSIZE >> > (n, d_odata, d_tdata, d_sdata, d_idata);
 
