@@ -5,7 +5,10 @@
 #include "device_launch_parameters.h"
 #include <cassert>
 
-#define BLOCKSIZE 512 // ensure blocksize is a power of 2 for this implementation
+#define BLOCKSIZE 128
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 5
+#define OFFSET(n)((n) >> NUM_BANKS + (n) >> (2 * LOG_NUM_BANKS))
 
 namespace StreamCompaction {
     namespace Efficient {
@@ -20,11 +23,16 @@ namespace StreamCompaction {
 
         __global__ void scan(int n, int ilog2, int* d_data, int* d_blockSums)
         {
+            extern __shared__ int temp[];
+
             int local = threadIdx.x;
             int global = (blockIdx.x * blockDim.x) + threadIdx.x;
-            int blockEnd = min(n - 1, (blockIdx.x + 1) * blockDim.x - 1);
+            int blockEnd = min(n - 1, (blockIdx.x + 1) * blockDim.x - 1); // global index
 
             if (global >= n) return;
+
+            temp[local + OFFSET(local)] = d_data[global];
+            __syncthreads();
 
             // running per block
             // upsweep
@@ -37,17 +45,23 @@ namespace StreamCompaction {
                 {
                     if (local % stride == 0)
                     {
-                        d_data[global + stride - 1] += d_data[global + prevStride - 1];
+                        int bi = local + stride - 1;
+                        int ai = local + prevStride - 1;
+                        bi += OFFSET(bi);
+                        ai += OFFSET(ai);
+
+                        temp[bi] += temp[ai];
+                        //d_data[global + stride - 1] += d_data[global + prevStride - 1];
                     }
                 }
                 __syncthreads();
             }
 
-            d_blockSums[blockIdx.x] = d_data[blockEnd]; // store before downsweeping
+            // store final sums and set to 0
+            if (global == blockEnd) d_blockSums[blockIdx.x] = temp[local + OFFSET(local)];
+            if (global == blockEnd) temp[local + OFFSET(local)] = 0;
 
             // downsweep
-            if (global == blockEnd) d_data[global] = 0;
-
             for (int d = ilog2 - 1; d >= 0; d--)
             {
                 int stride = 1 << (d + 1); // 2, 4, 8,...
@@ -57,13 +71,19 @@ namespace StreamCompaction {
                 {
                     if (local % stride == 0)
                     {
-                        int t = d_data[global + prevStride - 1]; // store left child data
-                        d_data[global + prevStride - 1] = d_data[global + stride - 1];
-                        d_data[global + stride - 1] += t; // add left child to right child
+                        int bi = local + stride - 1;
+                        int ai = local + prevStride - 1;
+                        bi += OFFSET(bi);
+                        ai += OFFSET(ai);
+
+                        int t = temp[ai];
+                        temp[ai] = temp[bi];
+                        temp[bi] += t;
                     }
                 }
                 __syncthreads();
             }
+            d_data[global] = temp[local + OFFSET(local)];
         }
 
         __global__ void add(int n, int* d_data, int* d_adder)
@@ -83,7 +103,7 @@ namespace StreamCompaction {
             int* d_blockSums;
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
-            scan << <numBlocks, BLOCKSIZE >> > (n, ilog2ceil(BLOCKSIZE), data, d_blockSums);
+            scan << <numBlocks, BLOCKSIZE, BLOCKSIZE * sizeof(int) >> > (n, ilog2ceil(BLOCKSIZE), data, d_blockSums);
 
             if (numBlocks >= BLOCKSIZE)
             {
@@ -91,7 +111,7 @@ namespace StreamCompaction {
             }
             else
             {
-                scan << <1, BLOCKSIZE >> > (numBlocks, ilog2ceil(BLOCKSIZE), d_blockSums, d_garbage);
+                scan << <1, BLOCKSIZE, BLOCKSIZE * sizeof(int) >> > (numBlocks, ilog2ceil(BLOCKSIZE), d_blockSums, d_garbage);
             }
             add << <numBlocks, BLOCKSIZE >> > (n, data, d_blockSums);
 
@@ -117,11 +137,11 @@ namespace StreamCompaction {
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
             timer().startGpuTimer();
-            scan << <numBlocks, BLOCKSIZE >> > (size, ilog2ceil(BLOCKSIZE), d_odata, d_blockSums);
+            scan << <numBlocks, BLOCKSIZE, BLOCKSIZE * sizeof(int) >> > (size, ilog2ceil(BLOCKSIZE), d_odata, d_blockSums);
 
             scanRecursive(numBlocks, d_blockSums);
 
-            add << <numBlocks, BLOCKSIZE >> > (n, d_odata, d_blockSums);
+            add << <numBlocks, BLOCKSIZE >> > (size, d_odata, d_blockSums);
             timer().endGpuTimer();
 
             cudaMemcpy(odata, d_odata, size * sizeof(int), cudaMemcpyDeviceToHost);
@@ -130,7 +150,7 @@ namespace StreamCompaction {
             cudaFree(d_blockSums);
         }
 
-        __global__ void temp(int n, int badVal, int* odata, int* idata)
+        __global__ void badVal(int n, int badVal, int* odata, int* idata)
         {
             int k = (blockIdx.x * blockDim.x) + threadIdx.x;
 
@@ -191,17 +211,17 @@ namespace StreamCompaction {
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
             timer().startGpuTimer();
-            temp << <numBlocks, BLOCKSIZE >> > (size, 0, d_tdata, d_idata);
+            badVal << <numBlocks, BLOCKSIZE >> > (size, 0, d_tdata, d_idata);
 
             cudaMemcpy(d_sdata, d_tdata, size * sizeof(int), cudaMemcpyDeviceToDevice);
 
-            scan << <numBlocks, BLOCKSIZE >> > (size, ilog2ceil(BLOCKSIZE), d_sdata, d_blockSums);
+            scan << <numBlocks, BLOCKSIZE, BLOCKSIZE * sizeof(int) >> > (size, ilog2ceil(BLOCKSIZE), d_sdata, d_blockSums);
 
             scanRecursive(numBlocks, d_blockSums);
 
-            add << <numBlocks, BLOCKSIZE >> > (n, d_sdata, d_blockSums);
+            add << <numBlocks, BLOCKSIZE >> > (size, d_sdata, d_blockSums);
 
-            scatter << <numBlocks, BLOCKSIZE >> > (n, d_odata, d_tdata, d_sdata, d_idata);
+            scatter << <numBlocks, BLOCKSIZE >> > (size, d_odata, d_tdata, d_sdata, d_idata);
 
             timer().endGpuTimer();
 
