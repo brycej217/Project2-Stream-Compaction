@@ -4,7 +4,7 @@
 #include "naive.h"
 #include "device_launch_parameters.h"
 
-#define BLOCKSIZE 128
+#define BLOCKSIZE 1024
 
 namespace StreamCompaction {
     namespace Naive {
@@ -20,13 +20,11 @@ namespace StreamCompaction {
         {
             int k = (blockIdx.x * blockDim.x) + threadIdx.x;
 
-            d_odata[k] = (k > 0) ? d_idata[k - 1] : 0;
-
             if (k >= n) return;
 
-            if (k >= pow(2, d - 1))
+            if (k >= 1 << (d - 1))
             {
-                d_odata[k] = d_idata[k - static_cast<int>(pow(2, d - 1))] + d_idata[k];
+                d_odata[k] = d_idata[k - (1 << (d - 1))] + d_idata[k];
             }
             else
             {
@@ -47,8 +45,6 @@ namespace StreamCompaction {
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
         void scan(int n, int *odata, const int *idata) {
-            timer().startGpuTimer();
-            
             int numBlocks = (n + BLOCKSIZE - 1) / BLOCKSIZE;
 
             int* d_odata;
@@ -61,26 +57,26 @@ namespace StreamCompaction {
             cudaMemcpy(d_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
 
             // ping-pong buffers
-            int currO = 1;
-            int currI = 0;
+            int currO = 0;
+            int currI = 1;
             int* d_data[2]; // pointer array for ping ponging
             d_data[0] = d_odata;
             d_data[1] = d_idata;
 
+            timer().startGpuTimer();
+            
+
             for (int d = 1; d <= ilog2ceil(n); d++)
             {
+                scan<<<numBlocks, BLOCKSIZE>>>(n, d, d_data[currO], d_data[currI]);
                 currO = (currO + 1) % 2;
                 currI = (currI + 1) % 2;
-                scan<<<numBlocks, BLOCKSIZE>>>(n, d, d_data[currO], d_data[currI]);
             }
-
-            currO = (currO + 1) % 2;
-            currI = (currI + 1) % 2;
             rightShift<<<numBlocks, BLOCKSIZE>>>(n, d_data[currO], d_data[currI]);
             
-            cudaMemcpy(odata, d_data[currO], n * sizeof(int), cudaMemcpyDeviceToHost);
-
             timer().endGpuTimer();
+
+            cudaMemcpy(odata, d_data[currO], n * sizeof(int), cudaMemcpyDeviceToHost);
         }
     }
 }

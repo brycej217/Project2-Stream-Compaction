@@ -16,11 +16,13 @@ namespace StreamCompaction {
             return timer;
         }
 
+        int* d_garbage;
+
         __global__ void scan(int n, int ilog2, int* d_data, int* d_blockSums)
         {
             int local = threadIdx.x;
             int global = (blockIdx.x * blockDim.x) + threadIdx.x;
-            int blockLim = (blockIdx.x + 1) * blockDim.x - 1;
+            int blockEnd = min(n - 1, (blockIdx.x + 1) * blockDim.x - 1);
 
             if (global >= n) return;
 
@@ -28,120 +30,99 @@ namespace StreamCompaction {
             // upsweep
             for (int d = 0; d < ilog2; d++)
             {
-                if (local % static_cast<int>(pow(2, d + 1)) == 0)
+                int stride = 1 << (d + 1); // 2, 4, 8,...
+                int prevStride = 1 << d; // 1, 2, 4,...
+
+                if (global + stride - 1 <= blockEnd)
                 {
-                    if ((global + static_cast<int>(pow(2, d + 1)) - 1) <= blockLim)
+                    if (local % stride == 0)
                     {
-                        d_data[global + static_cast<int>(pow(2, d + 1)) - 1] += d_data[global + static_cast<int>(pow(2, d)) - 1];
+                        d_data[global + stride - 1] += d_data[global + prevStride - 1];
                     }
                 }
                 __syncthreads();
             }
 
-            d_blockSums[blockIdx.x] = d_data[blockLim]; // store before downsweeping
-            
+            d_blockSums[blockIdx.x] = d_data[blockEnd]; // store before downsweeping
+
             // downsweep
-            if (global == blockLim) d_data[global] = 0;
+            if (global == blockEnd) d_data[global] = 0;
 
             for (int d = ilog2 - 1; d >= 0; d--)
             {
-                if (local % static_cast<int>(pow(2, d + 1)) == 0)
+                int stride = 1 << (d + 1); // 2, 4, 8,...
+                int prevStride = 1 << d; // 1, 2, 4,...
+
+                if (global + stride - 1 <= blockEnd)
                 {
-                    if ((global + static_cast<int>(pow(2, d + 1)) - 1) <= blockLim)
+                    if (local % stride == 0)
                     {
-                        int t = d_data[global + static_cast<int>(pow(2, d)) - 1];
-                        d_data[global + static_cast<int>(pow(2, d)) - 1] = d_data[global + static_cast<int>(pow(2, d + 1)) - 1];
-                        d_data[global + static_cast<int>(pow(2, d + 1)) - 1] += t;
+                        int t = d_data[global + prevStride - 1]; // store left child data
+                        d_data[global + prevStride - 1] = d_data[global + stride - 1];
+                        d_data[global + stride - 1] += t; // add left child to right child
                     }
                 }
                 __syncthreads();
             }
         }
 
-        __global__ void scanBlock(int n, int ilog2, int* d_data)
+        __global__ void add(int n, int* d_data, int* d_adder)
         {
             int k = (blockIdx.x * blockDim.x) + threadIdx.x;
 
             if (k >= n) return;
 
-            // upsweep
-            for (int d = 0; d < ilog2; d++)
-            {
-                if (k % static_cast<int>(pow(2, d + 1)) == 0)
-                {
-                    d_data[k + static_cast<int>(pow(2, d + 1)) - 1] += d_data[k + static_cast<int>(pow(2, d)) - 1];
-                }
-                __syncthreads();
-            }
-
-            // downsweep
-            if (k == n - 1) d_data[k] = 0;
-
-            for (int d = ilog2 - 1; d >= 0; d--)
-            {
-                if (k % static_cast<int>(pow(2, d + 1)) == 0)
-                {
-                    int t = d_data[k + static_cast<int>(pow(2, d)) - 1];
-                    d_data[k + static_cast<int>(pow(2, d)) - 1] = d_data[k + static_cast<int>(pow(2, d + 1)) - 1];
-                    d_data[k + static_cast<int>(pow(2, d + 1)) - 1] += t;
-                }
-                __syncthreads();
-            }
+            d_data[k] += d_adder[blockIdx.x];
         }
 
-        __global__ void add(int n, int* d_data, int* d_blockSums)
+        // helper function for recursive scan -- parameters: array length and data device memory pointer
+        void scanRecursive(int n, int* data)
         {
-            int k = (blockIdx.x * blockDim.x) + threadIdx.x;
+            int numBlocks = (n + BLOCKSIZE - 1) / BLOCKSIZE;
 
-            if (k >= n) return;
+            int* d_blockSums;
+            cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
-            d_data[k] += d_blockSums[blockIdx.x];
+            scan << <numBlocks, BLOCKSIZE >> > (n, ilog2ceil(BLOCKSIZE), data, d_blockSums);
+
+            if (numBlocks >= BLOCKSIZE)
+            {
+                scanRecursive(numBlocks, d_blockSums);
+            }
+            else
+            {
+                scan<< <1, BLOCKSIZE >> > (numBlocks, ilog2ceil(BLOCKSIZE), d_blockSums, d_garbage);
+            }
+            add << <numBlocks, BLOCKSIZE >> > (n, data, d_blockSums);
         }
 
         /**
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
-        void scan(int n, int *odata, const int *idata) {
-            timer().startGpuTimer();
-
-            // declare new memory to use in scan
-            int* h_data;
-            int* d_data;
-
+        void scan(int n, int* odata, const int* idata) {
             // create host visible memory scaled to power of 2
             int ilog2 = static_cast<int>(ilog2ceil(n));
             int size = static_cast<int>(pow(2, ilog2));
 
-            h_data = (int*)malloc(size * sizeof(int));
-            
-            // fill with zeros
-            for (int i = 0; i < size; i++)
-            {
-                h_data[i] = 0;
-            }
-
-            // create device memory scaled to power of 2
-            cudaMalloc((void**)&d_data, size * sizeof(int));
-            cudaMemcpy(d_data, idata, n * sizeof(int), cudaMemcpyHostToDevice); // copy values into device memory
+            int* d_odata;
+            int* d_blockSums;
+            cudaMalloc((void**)&d_odata, size * sizeof(int));
+            cudaMemcpy(d_odata, idata, size * sizeof(int), cudaMemcpyHostToDevice); // copy values into device memory
+            cudaMalloc((void**)&d_garbage, size * sizeof(int));
 
             // divide array into blocks
             int numBlocks = (size + BLOCKSIZE - 1) / BLOCKSIZE;
-
-            // declare block sum array to support scans of arbitrary length
-            int* d_blockSums;
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
 
-            scan<<<numBlocks, BLOCKSIZE>>>(size, ilog2ceil(BLOCKSIZE), d_data, d_blockSums);
+            timer().startGpuTimer();
+            scan<<<numBlocks, BLOCKSIZE>>>(size, ilog2ceil(BLOCKSIZE), d_odata, d_blockSums);
 
-            assert(numBlocks <= 1024); // if numBlocks is greater than 1024, we cannot operate on it
+            scanRecursive(numBlocks, d_blockSums);
 
-            scanBlock<<<1, numBlocks>>>(numBlocks, ilog2ceil(numBlocks), d_blockSums);
-
-            add<<<numBlocks, BLOCKSIZE>>>(size, d_data, d_blockSums);
-
-            cudaMemcpy(odata, d_data, size * sizeof(int), cudaMemcpyDeviceToHost);
-
+            add << <numBlocks, BLOCKSIZE >> > (n, d_odata, d_blockSums);
             timer().endGpuTimer();
+
+            cudaMemcpy(odata, d_odata, size * sizeof(int), cudaMemcpyDeviceToHost);
         }
 
         /**
@@ -150,17 +131,18 @@ namespace StreamCompaction {
         void scanGPU(int n, int* odata, const int* idata, int numBlocks) {
             // declare block sum array to support scans of arbitrary length
             int* d_blockSums;
+            int* d_garbage;
             cudaMalloc((void**)&d_blockSums, numBlocks * sizeof(int));
-
+            cudaMalloc((void**)&d_garbage, n * sizeof(int));
             cudaMemcpy(odata, idata, n * sizeof(int), cudaMemcpyDeviceToDevice);
 
-            scan<<<numBlocks, BLOCKSIZE>>>(n, ilog2ceil(BLOCKSIZE), odata, d_blockSums);
+            scan << <numBlocks, BLOCKSIZE >> > (n, ilog2ceil(BLOCKSIZE), odata, d_blockSums);
 
-            assert(numBlocks <= 1024); // if numBlocks is greater than 1024, we cannot operate on it
+            //assert(numBlocks <= 1024); // if numBlocks is greater than 1024, we cannot operate on it
 
-            scanBlock << <1, numBlocks >> > (numBlocks, ilog2ceil(numBlocks), d_blockSums);
+            scan<< <1, numBlocks >> > (numBlocks, ilog2ceil(numBlocks), d_blockSums, d_garbage);
 
-            add<<<numBlocks, BLOCKSIZE >> > (n, odata, d_blockSums);
+            add << <numBlocks, BLOCKSIZE >> > (n, odata, d_blockSums);
         }
 
         __global__ void temp(int n, int badVal, int* odata, int* idata)
@@ -200,8 +182,7 @@ namespace StreamCompaction {
          * @param idata  The array of elements to compact.
          * @returns      The number of elements remaining after compaction.
          */
-        int compact(int n, int *odata, const int *idata) {
-            timer().startGpuTimer();
+        int compact(int n, int* odata, const int* idata) {
 
             // create memory scaled to power of 2
             int ilog2 = static_cast<int>(ilog2ceil(n));
@@ -219,9 +200,16 @@ namespace StreamCompaction {
             cudaMemcpy(d_idata, idata, n * sizeof(int), cudaMemcpyHostToDevice);
 
             int numBlocks = (size + BLOCKSIZE - 1) / BLOCKSIZE;
-            temp<<<numBlocks, BLOCKSIZE>>>(n, 0, d_tdata, d_idata);
+
+
+            timer().startGpuTimer();
+            temp << <numBlocks, BLOCKSIZE >> > (n, 0, d_tdata, d_idata);
 
             scanGPU(size, d_sdata, d_tdata, numBlocks);
+
+            scatter << <numBlocks, BLOCKSIZE >> > (n, d_odata, d_tdata, d_sdata, d_idata);
+
+            timer().endGpuTimer();
 
             // get count
             int s = 0;
@@ -230,11 +218,7 @@ namespace StreamCompaction {
             cudaMemcpy(&t, d_tdata + (n - 1), sizeof(int), cudaMemcpyDeviceToHost);
             int count = s + t;
 
-            scatter<<<numBlocks, BLOCKSIZE>>>(n, d_odata, d_tdata, d_sdata, d_idata);
-
             cudaMemcpy(odata, d_odata, n * sizeof(int), cudaMemcpyDeviceToHost);
-
-            timer().endGpuTimer();
             return count;
         }
     }
