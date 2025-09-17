@@ -8,7 +8,7 @@ CUDA Stream Compaction
 * Tested on: Windows 11, Intel(R) CORE(TM) Ultra 9 275HX @ 2.70GHz 32.0GB, NVIDIA GeFORCE RTX 5080 Laptop GPU 16384MB
 
 # CIS 5650 Project 2 - Stream Compaction
-This project involved creating implementations of parallel scan and stream compaction algorithms in CUDA and testing their performance.  
+This project involved creating implementations of parallel scan and stream compaction algorithms in CUDA and testing their performance.    
 Namely, a work-efficient parallel scan, naive parallel scan, and cpu and thrust implementations for testing against. 
 The algorithms were based on class materials and excerpts from [GPU Gems 3 Chapter 39](https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda), the implementations of which I will discuss now:
 
@@ -73,12 +73,12 @@ This essentially ensures that for each multiple of the number of banks n on our 
 
 ## Performance Comparison
 The following charts show the performance comparison between the CPU, naive parallel scan, work-efficient parallel scan, work-efficient parallel scan with shared memory, and thrust implementations for different array sizes, 
-with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.
+with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.  
 ![](img/scan_p2.png)
 ![](img/scan_np2.png)
 
 The following charts show the performance comparison between the stream compaction implementations of CPU without scan, CPU with scan, work-efficient compaction, and work-efficient compaction using shared memory for different array sizes, 
-with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.
+with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.  
 ![](img/compaction_p2.png)
 ![](img/compaction_np2.png)
 
