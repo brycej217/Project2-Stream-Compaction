@@ -14,7 +14,7 @@ The algorithms were based on class materials and excerpts from [GPU Gems 3 Chapt
 
 ## Implementation
 ### Naive Scan
-![](img/naive.png)
+![](img/naive.png)  
 The naive implementation of the algorithm simply sees us adding values of a certain stride away from the target to the target in parallel, involving several iterations until the full scan is complete. 
 This involved launching several kernels in sequence, updating our stride each iteration:
 
@@ -27,7 +27,7 @@ for (int d = 1; d <= ilog2ceil(n); d++)
 While this could have been optimized with shared memory utilization, the optimization of this algorithm was not the intent of this project. Rather the optimization of the work-efficient scan was the main focal point of the project which I will discuss now.
 
 ### Work-Efficient Scan
-![](img/work.png)
+![](img/work.png)  
 The work-efficient scan algorithm is discussed in detail in [GPU Gems 3 Chapter 39.2](https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda), but its implementation caused several issues which needed to be addressed. 
 Namely:
 * Arbitrary Array Length
@@ -72,10 +72,12 @@ but in order to avoid potential bank conflicts, address padding was utilized, a 
 This essentially ensures that for each multiple of the number of banks n on our machine, we pad the address such that it differs from previous groupings of n address. Whether or not this improved runtime will be discussed in the analysis.
 
 ## Performance Comparison
+For the following performance analysis, the naive scan utilized a block size of 512, and the work-efficient scan utilized a block size of 128.  
+
 The following charts show the performance comparison between the CPU, naive parallel scan, work-efficient parallel scan, work-efficient parallel scan with shared memory, and thrust implementations for different array sizes, 
 with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.  
 ![](img/scan_p2.png)
-![](img/scan_np2.png)
+![](img/scan_np2.png)  
 
 The following charts show the performance comparison between the stream compaction implementations of CPU without scan, CPU with scan, work-efficient compaction, and work-efficient compaction using shared memory for different array sizes, 
 with the first and second charts showing array sizes of powers of two and non-powers of two respectfully.  
